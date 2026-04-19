@@ -1,0 +1,198 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>GPS Overlay Studio</title>
+<link href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=Syne:wght@400;600;700;800&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="{{ url_for('static', filename='css/app.css') }}">
+</head>
+<body>
+<header>
+  <div class="logo">🛰</div>
+  <h1>GPS Overlay <span>Studio</span></h1>
+  <span class="tag">v1.0</span>
+</header>
+<main>
+
+<!-- ══ SIDEBAR ══ -->
+<aside class="sidebar">
+
+  <div class="section">
+    <div class="section-title">File Paths</div>
+    <div class="field">
+      <div class="path-label">🎬 Video file path</div>
+      <input class="path-input" id="videoPath" placeholder="C:\Videos\ride.mp4 or /home/user/ride.mp4">
+      <div class="path-status" id="videoStatus">Enter video file path</div>
+    </div>
+    <div class="field">
+      <div class="path-label">📍 GPX file path</div>
+      <input class="path-input" id="gpxPath" placeholder="C:\GPS\track.gpx or /home/user/track.gpx">
+      <div class="path-status" id="gpxStatus">Enter GPX path to auto-preview</div>
+    </div>
+    <div class="field">
+      <div class="path-label">💾 Output path (leave blank to auto-generate)</div>
+      <input class="path-input" id="outputPath" placeholder="Leave blank to save to outputs/ folder">
+    </div>
+  </div>
+
+  <div class="section">
+    <div class="section-title">Widgets</div>
+    <div class="widget-grid">
+      <div class="wtoggle active" data-widget="map">
+        <div class="wrow"><span class="wicon">🗺️</span><span class="wcheck">✓</span></div>
+        <div class="wname">Map</div><div class="wdesc">Track + position</div>
+      </div>
+      <div class="wtoggle active" data-widget="speed">
+        <div class="wrow"><span class="wicon">⚡</span><span class="wcheck">✓</span></div>
+        <div class="wname">Speed</div><div class="wdesc">km/h</div>
+      </div>
+      <div class="wtoggle active" data-widget="elevation">
+        <div class="wrow"><span class="wicon">🏔️</span><span class="wcheck">✓</span></div>
+        <div class="wname">Elevation</div><div class="wdesc">Line chart</div>
+      </div>
+      <div class="wtoggle" data-widget="grade">
+        <div class="wrow"><span class="wicon">📐</span><span class="wcheck"></span></div>
+        <div class="wname">Grade</div><div class="wdesc">% slope</div>
+      </div>
+      <div class="wtoggle" data-widget="distance">
+        <div class="wrow"><span class="wicon">📏</span><span class="wcheck"></span></div>
+        <div class="wname">Distance</div><div class="wdesc">Cumulative km</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="section">
+    <div class="section-title">Overlay Position</div>
+    <div class="pos-grid">
+      <div class="pos-btn active" data-pos="top-left">↖ Top Left</div>
+      <div class="pos-btn" data-pos="top-right">↗ Top Right</div>
+      <div class="pos-btn" data-pos="bottom-left">↙ Bottom Left</div>
+      <div class="pos-btn" data-pos="bottom-right">↘ Bottom Right</div>
+    </div>
+  </div>
+
+  <div class="section">
+    <div class="section-title">Style & Encoding</div>
+    <div class="field">
+      <div class="flabel">Output Mode</div>
+      <div class="toggle-row" id="modeToggle">
+        <div class="tbtn active" data-mode="burn">🔥 Burn to Video</div>
+        <div class="tbtn" data-mode="overlay">🎭 Transparent Overlay</div>
+      </div>
+    </div>
+    <div id="burnOptions">
+    <div class="field">
+      <div class="flabel">Encoder</div>
+      <div class="toggle-row" id="encoderToggle">
+        <div class="tbtn active" data-encoder="cpu">🖥 CPU (libx264)</div>
+        <div class="tbtn" data-encoder="gpu">⚡ GPU (NVENC)</div>
+      </div>
+    </div>
+    </div>
+    <div id="overlayOptions" style="display:none">
+    <div class="field">
+      <div class="flabel">Transparent Format</div>
+      <div class="toggle-row" id="overlayFmtToggle">
+        <div class="tbtn active" data-fmt="prores">🍎 ProRes 4444 (.mov)</div>
+        <div class="tbtn" data-fmt="webm">🌐 WebM VP9 (.webm)</div>
+      </div>
+    </div>
+    <div style="font-family:var(--mono);font-size:0.62rem;color:var(--muted);line-height:1.6;padding:8px;background:var(--bg);border:1px solid var(--border)">
+      ProRes 4444: DaVinci / Premiere / FCP<br>
+      WebM VP9: Open source, smaller files<br>
+      ⚠️ CapCut does not support transparent videos
+    </div>
+    </div>
+    <div class="field">
+      <div class="flabel">Theme</div>
+      <div class="toggle-row" id="themeToggle">
+        <div class="tbtn active" data-theme="dark">⬛ Dark</div>
+        <div class="tbtn" data-theme="light">⬜ Light</div>
+      </div>
+    </div>
+    <div class="field">
+      <div class="flabel">Widget Opacity</div>
+      <div class="range-row">
+        <input type="range" id="opacitySlider" min="0" max="100" value="82">
+        <span class="range-val" id="opacityVal">82%</span>
+      </div>
+    </div>
+    <div class="field">
+      <div class="flabel">Accent Color</div>
+      <div class="color-row">
+        <input type="color" id="accentColor" value="#52d282">
+        <span class="color-label" id="accentLabel">theme default</span>
+        <button class="color-reset" id="accentReset">↩</button>
+      </div>
+    </div>
+    <div class="field">
+      <div class="flabel">Map Background</div>
+      <div class="toggle-row" id="mapTilesToggle">
+        <div class="tbtn active" data-tiles="off">Track Only</div>
+        <div class="tbtn" data-tiles="on">Load Tiles</div>
+      </div>
+    </div>
+    <div id="mapTileOptions" style="display:none">
+    <div class="two-col">
+      <div class="field">
+        <div class="flabel">Map Style</div>
+        <select id="mapStyle">
+          <option value="voyager">Voyager</option>
+          <option value="dark">Dark</option>
+          <option value="light">Light</option>
+          <option value="topo">Topo</option>
+        </select>
+      </div>
+      <div class="field">
+        <div class="flabel">Map Zoom</div>
+        <select id="zoomLevel">
+          <option value="13">13 City</option>
+          <option value="14">14</option>
+          <option value="15" selected>15 Street</option>
+          <option value="16">16 Detail</option>
+          <option value="17">17 Max</option>
+        </select>
+      </div>
+    </div>
+    </div>
+    <div class="field">
+      <div class="range-row">
+        <div class="flabel">GPX Time Offset</div>
+        <div class="range-val" id="offsetVal">0s</div>
+      </div>
+      <input type="range" id="offsetSlider" min="-300" max="300" value="0">
+    </div>
+  </div>
+
+  <button class="render-btn" id="renderBtn" disabled>▶ Start Render</button>
+</aside>
+
+<!-- ══ RIGHT ══ -->
+<div class="right-panel">
+  <div class="preview-panel">
+    <div class="panel-header">Live Preview — updates instantly with parameter changes</div>
+    <div class="preview-wrap">
+      <canvas id="previewCanvas" width="960" height="540" style="display:none;"></canvas>
+      <div class="preview-hint" id="previewHint">
+        <div class="big">🛰️</div>
+        Enter a GPX path to load the track<br>and preview the overlay in real time
+      </div>
+    </div>
+  </div>
+
+  <div class="progress-section" id="progressSection">
+    <div class="panel-header">Render Progress</div>
+    <div class="progress-track"><div class="progress-fill" id="progressFill"></div></div>
+    <div class="log-box" id="logBox"></div>
+  </div>
+
+  <div class="output-section" id="outputSection">
+    <a class="dl-btn" id="dlBtn" download>⬇ Download Video</a>
+    <span class="out-info" id="outInfo"></span>
+  </div>
+</div>
+</main>
+
+<script src="{{ url_for('static', filename='js/app.js') }}"></script>
+</body>
+</html>
