@@ -2,6 +2,12 @@
 
 Burns GPS track data (speed, elevation, map, grade, distance) as visual overlays onto video files. Use the web UI for a live preview, or the CLI to script batch renders.
 
+## Demo
+
+[![GPS Overlay Studio demo](https://img.youtube.com/vi/NbdiBdZwiXg/maxresdefault.jpg)](https://youtu.be/NbdiBdZwiXg)
+
+---
+
 Two output modes:
 - **Burn** — composites widgets directly onto the video (H.264 / NVENC)
 - **Transparent Overlay** — generates an alpha-channel clip (ProRes 4444 or WebM VP9) for NLEs like DaVinci Resolve, Premiere, or Final Cut Pro
