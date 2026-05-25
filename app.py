@@ -16,8 +16,17 @@ from flask import Flask, jsonify, render_template, request, send_file
 
 from web.preview import clean_path, extract_frame, quick_parse_gpx
 
-app = Flask(__name__)
-OUTPUT_DIR = Path("outputs")
+# When frozen by PyInstaller, templates/static live under sys._MEIPASS, not __file__.
+_BASE = Path(getattr(sys, "_MEIPASS", Path(__file__).parent))
+app = Flask(__name__,
+            template_folder=str(_BASE / "templates"),
+            static_folder=str(_BASE / "static"))
+
+# Writes go next to the exe in frozen mode so they survive between runs.
+if getattr(sys, "frozen", False):
+    OUTPUT_DIR = Path(sys.executable).parent / "outputs"
+else:
+    OUTPUT_DIR = Path("outputs")
 OUTPUT_DIR.mkdir(exist_ok=True)
 
 jobs: dict = {}
@@ -86,9 +95,14 @@ def render():
     jobs[job_id] = {"status": "running", "progress": 0, "logs": [], "output": out_path, "error": None}
 
     def run():
-        script = Path(__file__).parent / "gps_overlay.py"
+        # In frozen mode the exe itself handles CLI args (no separate .py script).
+        if getattr(sys, "frozen", False):
+            base_cmd = [sys.executable]
+        else:
+            script = Path(__file__).parent / "gps_overlay.py"
+            base_cmd = [sys.executable, "-u", str(script)]
         cmd = [
-            sys.executable, "-u", str(script),
+            *base_cmd,
             "--video",       clean_path(data["video_path"]),
             "--gpx",         clean_path(data["gpx_path"]),
             "--output",      out_path,

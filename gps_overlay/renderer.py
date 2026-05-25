@@ -2,6 +2,7 @@
 
 import argparse
 import os
+import queue
 import subprocess
 import sys
 import threading
@@ -146,20 +147,48 @@ def _render_overlay(args, points, widgets, coords, map_canvas, tx, ty, fps, tota
         sys.exit(1)
 
 
+def _open_decoder(video_path: str, use_gpu: bool):
+    """Return an ffmpeg subprocess that writes raw BGR24 frames to stdout."""
+    import subprocess as sp
+
+    # -hwaccel cuda without -hwaccel_output_format lets the GPU decoder run
+    # but outputs frames in system memory — no hwdownload filter needed.
+    hwaccel = ["-hwaccel", "cuda"] if use_gpu else []
+    cmd = [
+        "ffmpeg", "-y",
+        *hwaccel,
+        "-i", video_path,
+        "-f", "rawvideo", "-pix_fmt", "bgr24",
+        "pipe:1",
+    ]
+    return sp.Popen(cmd, stdout=sp.PIPE, stderr=sp.PIPE)
+
+
 def _render_burn(args, points, widgets, coords, map_canvas, tx, ty, cap, fps, total, vw, vh):
-    """Burn widgets directly onto the video frames (libx264 or NVIDIA NVENC)."""
+    """Burn widgets onto video frames using a parallel decode→draw→encode pipeline.
+
+    Pipeline stages (each runs in its own thread):
+      decode_thread  : reads raw BGR24 frames → decode_q
+      worker_threads : draw widgets on frames  → encode_q  (N parallel workers)
+      encode_thread  : writes frames to ffmpeg stdin in order
+    """
     import subprocess as sp
 
     encoder = getattr(args, "encoder", "cpu")
-    if encoder == "gpu" and check_ffmpeg_encoder("h264_nvenc"):
+    use_gpu = encoder == "gpu" and check_ffmpeg_encoder("h264_nvenc")
+
+    if use_gpu:
         ffmpeg_codec = ["h264_nvenc", "-preset", "p4", "-rc", "vbr", "-cq", "20"]
         print("[ENCODE] ✅ GPU (NVIDIA NVENC h264)", flush=True)
+        print("[DECODE] GPU (CUDA hwaccel)", flush=True)
     else:
         if encoder == "gpu":
             print("[ENCODE] ⚠️  NVENC unavailable, falling back to CPU", flush=True)
         ffmpeg_codec = ["libx264", "-preset", "fast", "-crf", "18"]
         print("[ENCODE] CPU (libx264)", flush=True)
+        print("[DECODE] CPU (OpenCV)", flush=True)
 
+    # --- encoder process ---
     ffmpeg_cmd = [
         "ffmpeg", "-y",
         "-f", "rawvideo", "-vcodec", "rawvideo",
@@ -173,59 +202,149 @@ def _render_burn(args, points, widgets, coords, map_canvas, tx, ty, cap, fps, to
         args.output,
     ]
     ffmpeg_proc = sp.Popen(ffmpeg_cmd, stdin=sp.PIPE, stderr=sp.PIPE)
-    stderr_lines: List[str] = []
+    enc_stderr: List[str] = []
+    threading.Thread(
+        target=lambda: [enc_stderr.append(l.decode(errors="replace").rstrip())
+                        for l in ffmpeg_proc.stderr],
+        daemon=True,
+    ).start()
 
-    def drain_stderr():
-        for line in ffmpeg_proc.stderr:
-            stderr_lines.append(line.decode(errors="replace").rstrip())
-
-    stderr_thread = threading.Thread(target=drain_stderr, daemon=True)
-    stderr_thread.start()
+    # --- queues ---
+    # decode_q holds (frame_index, raw_frame); encode_q holds (frame_index, drawn_frame)
+    # bounded to cap memory: at 4K/30fps each frame ~25 MB, so 32 frames ≈ 800 MB peak
+    n_workers = max(2, min(os.cpu_count() or 4, 8))
+    decode_q: queue.Queue = queue.Queue(maxsize=n_workers * 2)
+    encode_q: queue.Queue = queue.Queue(maxsize=n_workers * 2)
+    _DONE = object()  # sentinel
 
     duration = total / fps
     time_index = make_time_index(points)
-    report_interval = max(1, total // 100)
 
-    print(f"[RENDER] Processing {total} frames...", flush=True)
-    fi = 0
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            break
-
+    def _gps_idx(fi: int) -> int:
         video_sec = fi / fps
         if time_index:
             idx = find_idx(time_index, video_sec, args.offset)
         else:
             idx = int(video_sec / duration * (len(points) - 1))
-        idx = max(0, min(idx, len(points) - 1))
+        return max(0, min(idx, len(points) - 1))
 
-        for widget, (wx, wy) in zip(widgets, coords):
-            widget.draw(frame, wx, wy, idx, points, map_canvas=map_canvas, tx=tx, ty=ty, zoom=args.zoom)
+    # --- stage 1: decode ---
+    def decode_thread():
+        frame_bytes = vw * vh * 3
+        if use_gpu:
+            decoder = _open_decoder(args.video, use_gpu=True)
+            dec_stderr: List[str] = []
+            threading.Thread(
+                target=lambda: [dec_stderr.append(l.decode(errors="replace").rstrip())
+                                for l in decoder.stderr],
+                daemon=True,
+            ).start()
+            fi = 0
+            while True:
+                raw = decoder.stdout.read(frame_bytes)
+                if len(raw) < frame_bytes:
+                    if dec_stderr:
+                        print("[DECODE] ffmpeg stderr:\n" + "\n".join(dec_stderr[-5:]), flush=True)
+                    break
+                frame = np.frombuffer(raw, dtype=np.uint8).reshape((vh, vw, 3)).copy()
+                decode_q.put((fi, frame))
+                fi += 1
+            try:
+                decoder.stdout.close()
+            except Exception:
+                pass
+            decoder.wait()
+        else:
+            fi = 0
+            while True:
+                ret, frame = cap.read()
+                if not ret:
+                    break
+                decode_q.put((fi, frame))
+                fi += 1
+        # one sentinel per worker
+        for _ in range(n_workers):
+            decode_q.put(_DONE)
 
+    # --- stage 2: draw widgets (N parallel workers) ---
+    def draw_worker():
+        while True:
+            item = decode_q.get()
+            if item is _DONE:
+                encode_q.put(_DONE)
+                return
+            fi, frame = item
+            idx = _gps_idx(fi)
+            for widget, (wx, wy) in zip(widgets, coords):
+                widget.draw(frame, wx, wy, idx, points,
+                            map_canvas=map_canvas, tx=tx, ty=ty, zoom=args.zoom)
+            encode_q.put((fi, frame))
+
+    # --- stage 3: encode — must write frames in order ---
+    pipe_error = threading.Event()
+
+    def encode_thread():
+        pending: dict = {}  # fi → frame, for reordering
+        next_fi = 0
+        done_workers = 0
+        while done_workers < n_workers:
+            item = encode_q.get()
+            if item is _DONE:
+                done_workers += 1
+                continue
+            fi, frame = item
+            pending[fi] = frame
+            while next_fi in pending:
+                try:
+                    ffmpeg_proc.stdin.write(pending.pop(next_fi).tobytes())
+                except BrokenPipeError:
+                    print("❌ ffmpeg pipe broken", flush=True)
+                    pipe_error.set()
+                    return
+                next_fi += 1
         try:
-            ffmpeg_proc.stdin.write(frame.tobytes())
-        except BrokenPipeError:
-            print("❌ ffmpeg pipe broken", flush=True)
-            break
+            ffmpeg_proc.stdin.close()
+        except Exception:
+            pass
 
-        fi += 1
-        if fi % report_interval == 0 or fi >= total:
-            pct = fi / total * 100
-            print(f"PROGRESS {pct:.1f} ({fi}/{total})", flush=True)
+    # --- launch threads ---
+    t_decode = threading.Thread(target=decode_thread, daemon=True)
+    t_encode = threading.Thread(target=encode_thread, daemon=True)
+    workers = [threading.Thread(target=draw_worker, daemon=True) for _ in range(n_workers)]
 
-    try:
-        ffmpeg_proc.stdin.close()
-    except Exception:
-        pass
+    print(f"[RENDER] Processing {total} frames with {n_workers} draw workers...", flush=True)
+    t_decode.start()
+    for w in workers:
+        w.start()
+    t_encode.start()
+
+    # lightweight progress counter — intercept stdin writes
+    report_interval = max(1, total // 100)
+    frames_written = [0]
+    _orig_stdin_write = ffmpeg_proc.stdin.write
+
+    def _counted_write(data):
+        _orig_stdin_write(data)
+        frames_written[0] += 1
+        fw = frames_written[0]
+        if fw % report_interval == 0 or fw >= total:
+            pct = fw / total * 100
+            print(f"PROGRESS {pct:.1f} ({fw}/{total})", flush=True)
+
+    ffmpeg_proc.stdin.write = _counted_write
+
+    t_decode.join()
+    for w in workers:
+        w.join()
+    t_encode.join()
+
     ffmpeg_proc.wait()
-    stderr_thread.join(timeout=3)
 
     if ffmpeg_proc.returncode == 0:
         print(f"PROGRESS 100.0 ({total}/{total})", flush=True)
         print(f"✅ Done: {args.output}", flush=True)
     else:
-        err = "\n".join(stderr_lines[-20:])
+        err = "\n".join(enc_stderr[-20:])
         print(f"❌ ffmpeg error:\n{err}", flush=True)
         sys.exit(1)
 

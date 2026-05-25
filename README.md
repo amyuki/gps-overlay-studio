@@ -117,9 +117,11 @@ All widget bars use the accent colour. The current position on the map is shown 
 | Mode | Codec | Notes |
 |------|-------|-------|
 | CPU | `libx264` | Works everywhere |
-| GPU | `h264_nvenc` | Requires NVIDIA GPU + CUDA drivers |
+| GPU | `h264_nvenc` | Requires NVIDIA GPU + CUDA drivers; also enables CUDA hardware decode |
 | Overlay (ProRes) | `prores_ks -profile:v 4444` | Alpha channel, large file, NLE-compatible |
 | Overlay (WebM) | `libvpx-vp9` | Alpha channel, smaller file, open source |
+
+GPU mode (`--encoder gpu`) runs a parallel pipeline: CUDA hardware decode → multi-threaded widget drawing (one thread per CPU core, up to 8) → NVENC encode. All three stages run concurrently so the GPU encoder stays fed.
 
 ---
 
