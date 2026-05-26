@@ -17,7 +17,8 @@ Two output modes:
 ## Requirements
 
 - Python 3.8+
-- [FFmpeg](https://ffmpeg.org/download.html) on your `PATH`
+- [FFmpeg](https://ffmpeg.org/download.html) on your `PATH` (full build recommended — must include libx264; NVENC optional)
+- NVIDIA GPU + driver ≥ 452.39 for `--encoder gpu`
 
 ```bash
 pip install flask opencv-python numpy requests
@@ -50,7 +51,7 @@ python gps_overlay.py --video ride.mp4 --gpx track.gpx \
 python gps_overlay.py --video ride.mp4 --gpx track.gpx \
   --mode overlay --overlay-fmt prores --output overlay.mov
 
-# GPU encoding + map tiles
+# GPU pipeline (CUDA decode + NVENC encode, ~10× faster at 4K)
 python gps_overlay.py --video ride.mp4 --gpx track.gpx \
   --encoder gpu --map-style topo --zoom 16
 
@@ -116,12 +117,12 @@ All widget bars use the accent colour. The current position on the map is shown 
 
 | Mode | Codec | Notes |
 |------|-------|-------|
-| CPU | `libx264` | Works everywhere |
-| GPU | `h264_nvenc` | Requires NVIDIA GPU + CUDA drivers; also enables CUDA hardware decode |
+| CPU | `libx264` | Works everywhere; OpenCV decodes frames, Python composites widgets |
+| GPU | `h264_nvenc` | Requires NVIDIA GPU + CUDA drivers; full ffmpeg pipeline (see below) |
 | Overlay (ProRes) | `prores_ks -profile:v 4444` | Alpha channel, large file, NLE-compatible |
 | Overlay (WebM) | `libvpx-vp9` | Alpha channel, smaller file, open source |
 
-GPU mode (`--encoder gpu`) runs a parallel pipeline: CUDA hardware decode → multi-threaded widget drawing (one thread per CPU core, up to 8) → NVENC encode. All three stages run concurrently so the GPU encoder stays fed.
+**GPU pipeline** (`--encoder gpu`): Python renders only the widget bounding box (≈700 KB/frame BGRA at 4K) and pipes it to ffmpeg. ffmpeg handles CUDA hardware decode of the source video, alpha-composites the widget layer via its `overlay` filter, and encodes with NVENC — all without routing full video frames through Python. At 4K/30fps this is typically **10× faster** than CPU mode (measured: ~140 fps vs ~13 fps).
 
 ---
 

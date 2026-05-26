@@ -2,7 +2,6 @@
 
 import argparse
 import os
-import queue
 import subprocess
 import sys
 import threading
@@ -147,55 +146,55 @@ def _render_overlay(args, points, widgets, coords, map_canvas, tx, ty, fps, tota
         sys.exit(1)
 
 
-def _open_decoder(video_path: str, use_gpu: bool):
-    """Return an ffmpeg subprocess that writes raw BGR24 frames to stdout."""
-    import subprocess as sp
-
-    # -hwaccel cuda without -hwaccel_output_format lets the GPU decoder run
-    # but outputs frames in system memory — no hwdownload filter needed.
-    hwaccel = ["-hwaccel", "cuda"] if use_gpu else []
-    cmd = [
-        "ffmpeg", "-y",
-        *hwaccel,
-        "-i", video_path,
-        "-f", "rawvideo", "-pix_fmt", "bgr24",
-        "pipe:1",
-    ]
-    return sp.Popen(cmd, stdout=sp.PIPE, stderr=sp.PIPE)
-
 
 def _render_burn(args, points, widgets, coords, map_canvas, tx, ty, cap, fps, total, vw, vh):
-    """Burn widgets onto video frames using a parallel decode→draw→encode pipeline.
+    """Burn widgets onto video using ffmpeg overlay filter.
 
-    Pipeline stages (each runs in its own thread):
-      decode_thread  : reads raw BGR24 frames → decode_q
-      worker_threads : draw widgets on frames  → encode_q  (N parallel workers)
-      encode_thread  : writes frames to ffmpeg stdin in order
+    Python only pipes the small widget canvas (widget region only, BGRA) to
+    ffmpeg. ffmpeg handles decode, overlay compositing, and encode entirely on
+    its own — no full-frame pipe I/O in Python.
+
+    Pipeline:
+      ffmpeg input 0: original video  (decoded + encoded by ffmpeg/GPU)
+      ffmpeg input 1: widget BGRA     (piped from Python, widget bbox only)
+      ffmpeg filter:  overlay=x:y with alpha blending
     """
     import subprocess as sp
+    import time
 
     encoder = getattr(args, "encoder", "cpu")
     use_gpu = encoder == "gpu" and check_ffmpeg_encoder("h264_nvenc")
 
     if use_gpu:
         ffmpeg_codec = ["h264_nvenc", "-preset", "p4", "-rc", "vbr", "-cq", "20"]
+        hwaccel = ["-hwaccel", "cuda"]
         print("[ENCODE] ✅ GPU (NVIDIA NVENC h264)", flush=True)
         print("[DECODE] GPU (CUDA hwaccel)", flush=True)
     else:
         if encoder == "gpu":
             print("[ENCODE] ⚠️  NVENC unavailable, falling back to CPU", flush=True)
         ffmpeg_codec = ["libx264", "-preset", "fast", "-crf", "18"]
+        hwaccel = []
         print("[ENCODE] CPU (libx264)", flush=True)
-        print("[DECODE] CPU (OpenCV)", flush=True)
+        print("[DECODE] CPU", flush=True)
 
-    # --- encoder process ---
+    # compute widget bounding box (top-left origin, covers all widgets)
+    ox = min(wx for _, (wx, _) in zip(widgets, coords))
+    oy = min(wy for _, (_, wy) in zip(widgets, coords))
+    ow = min(vw, max(wx + w.width()  for w, (wx, _) in zip(widgets, coords)) - ox)
+    oh = min(vh, max(wy + w.height() for w, (_, wy) in zip(widgets, coords)) - oy)
+
+    # ffmpeg: video + piped BGRA widget stream → overlay → encode
+    # [1:v] is the piped BGRA canvas sized to the widget bbox
     ffmpeg_cmd = [
         "ffmpeg", "-y",
+        *hwaccel,
+        "-i", args.video,                                   # input 0: source video
         "-f", "rawvideo", "-vcodec", "rawvideo",
-        "-s", f"{vw}x{vh}", "-pix_fmt", "bgr24", "-r", str(fps),
-        "-i", "pipe:0",
-        "-i", args.video,
-        "-map", "0:v", "-map", "1:a?",
+        "-s", f"{ow}x{oh}", "-pix_fmt", "bgra", "-r", str(fps),
+        "-i", "pipe:0",                                     # input 1: widget BGRA
+        "-filter_complex", f"[0:v][1:v]overlay={ox}:{oy}",
+        "-map", "0:a?",
         "-vcodec", *ffmpeg_codec,
         "-acodec", "aac", "-b:a", "192k",
         "-pix_fmt", "yuv420p", "-movflags", "+faststart",
@@ -209,13 +208,7 @@ def _render_burn(args, points, widgets, coords, map_canvas, tx, ty, cap, fps, to
         daemon=True,
     ).start()
 
-    # --- queues ---
-    # decode_q holds (frame_index, raw_frame); encode_q holds (frame_index, drawn_frame)
-    # bounded to cap memory: at 4K/30fps each frame ~25 MB, so 32 frames ≈ 800 MB peak
-    n_workers = max(2, min(os.cpu_count() or 4, 8))
-    decode_q: queue.Queue = queue.Queue(maxsize=n_workers * 2)
-    encode_q: queue.Queue = queue.Queue(maxsize=n_workers * 2)
-    _DONE = object()  # sentinel
+    cap.release()  # ffmpeg decodes the video directly — OpenCV not needed
 
     duration = total / fps
     time_index = make_time_index(points)
@@ -228,116 +221,63 @@ def _render_burn(args, points, widgets, coords, map_canvas, tx, ty, cap, fps, to
             idx = int(video_sec / duration * (len(points) - 1))
         return max(0, min(idx, len(points) - 1))
 
-    # --- stage 1: decode ---
-    def decode_thread():
-        frame_bytes = vw * vh * 3
-        if use_gpu:
-            decoder = _open_decoder(args.video, use_gpu=True)
-            dec_stderr: List[str] = []
-            threading.Thread(
-                target=lambda: [dec_stderr.append(l.decode(errors="replace").rstrip())
-                                for l in decoder.stderr],
-                daemon=True,
-            ).start()
-            fi = 0
-            while True:
-                raw = decoder.stdout.read(frame_bytes)
-                if len(raw) < frame_bytes:
-                    if dec_stderr:
-                        print("[DECODE] ffmpeg stderr:\n" + "\n".join(dec_stderr[-5:]), flush=True)
-                    break
-                frame = np.frombuffer(raw, dtype=np.uint8).reshape((vh, vw, 3)).copy()
-                decode_q.put((fi, frame))
-                fi += 1
-            try:
-                decoder.stdout.close()
-            except Exception:
-                pass
-            decoder.wait()
-        else:
-            fi = 0
-            while True:
-                ret, frame = cap.read()
-                if not ret:
-                    break
-                decode_q.put((fi, frame))
-                fi += 1
-        # one sentinel per worker
-        for _ in range(n_workers):
-            decode_q.put(_DONE)
+    # widget canvas: only the bbox region, BGRA
+    _cached_idx: List[int] = [-1]
+    _widget_bgra = np.zeros((oh, ow, 4), dtype=np.uint8)
 
-    # --- stage 2: draw widgets (N parallel workers) ---
-    def draw_worker():
-        while True:
-            item = decode_q.get()
-            if item is _DONE:
-                encode_q.put(_DONE)
-                return
-            fi, frame = item
-            idx = _gps_idx(fi)
-            for widget, (wx, wy) in zip(widgets, coords):
-                widget.draw(frame, wx, wy, idx, points,
-                            map_canvas=map_canvas, tx=tx, ty=ty, zoom=args.zoom)
-            encode_q.put((fi, frame))
+    def _refresh_widget(idx: int) -> None:
+        # draw widgets onto a full-frame scratch, then crop to bbox
+        scratch = np.zeros((vh, vw, 3), dtype=np.uint8)
+        for widget, (wx, wy) in zip(widgets, coords):
+            widget.draw(scratch, wx, wy, idx, points,
+                        map_canvas=map_canvas, tx=tx, ty=ty, zoom=args.zoom)
+        region = scratch[oy:oy + oh, ox:ox + ow]
+        _widget_bgra[:, :, :3] = region
+        # alpha: fully opaque where any pixel was drawn, transparent elsewhere
+        _widget_bgra[:, :, 3] = np.where(region.any(axis=2), 255, 0).astype(np.uint8)
+        _cached_idx[0] = idx
 
-    # --- stage 3: encode — must write frames in order ---
-    pipe_error = threading.Event()
-
-    def encode_thread():
-        pending: dict = {}  # fi → frame, for reordering
-        next_fi = 0
-        done_workers = 0
-        while done_workers < n_workers:
-            item = encode_q.get()
-            if item is _DONE:
-                done_workers += 1
-                continue
-            fi, frame = item
-            pending[fi] = frame
-            while next_fi in pending:
-                try:
-                    ffmpeg_proc.stdin.write(pending.pop(next_fi).tobytes())
-                except BrokenPipeError:
-                    print("❌ ffmpeg pipe broken", flush=True)
-                    pipe_error.set()
-                    return
-                next_fi += 1
-        try:
-            ffmpeg_proc.stdin.close()
-        except Exception:
-            pass
-
-    # --- launch threads ---
-    t_decode = threading.Thread(target=decode_thread, daemon=True)
-    t_encode = threading.Thread(target=encode_thread, daemon=True)
-    workers = [threading.Thread(target=draw_worker, daemon=True) for _ in range(n_workers)]
-
-    print(f"[RENDER] Processing {total} frames with {n_workers} draw workers...", flush=True)
-    t_decode.start()
-    for w in workers:
-        w.start()
-    t_encode.start()
-
-    # lightweight progress counter — intercept stdin writes
+    # --- main loop: only write widget BGRA per frame ---
     report_interval = max(1, total // 100)
-    frames_written = [0]
-    _orig_stdin_write = ffmpeg_proc.stdin.write
+    print(f"[RENDER] Processing {total} frames "
+          f"(widget pipe: {ow}x{oh} BGRA = {ow*oh*4//1024}KB/frame vs "
+          f"{vw*vh*3//1024//1024}MB/frame full)...", flush=True)
 
-    def _counted_write(data):
-        _orig_stdin_write(data)
-        frames_written[0] += 1
-        fw = frames_written[0]
-        if fw % report_interval == 0 or fw >= total:
-            pct = fw / total * 100
-            print(f"PROGRESS {pct:.1f} ({fw}/{total})", flush=True)
+    fi = 0
+    redraws = 0
+    t_start = time.monotonic()
+    t_last  = t_start
+    fi_last = 0
+    while fi < total:
+        idx = _gps_idx(fi)
+        if idx != _cached_idx[0]:
+            _refresh_widget(idx)
+            redraws += 1
 
-    ffmpeg_proc.stdin.write = _counted_write
+        try:
+            ffmpeg_proc.stdin.write(_widget_bgra.tobytes())
+        except BrokenPipeError:
+            print("❌ ffmpeg pipe broken", flush=True)
+            break
 
-    t_decode.join()
-    for w in workers:
-        w.join()
-    t_encode.join()
+        fi += 1
+        if fi % report_interval == 0 or fi >= total:
+            now = time.monotonic()
+            interval_fps = (fi - fi_last) / max(now - t_last, 1e-6)
+            avg_fps      = fi / max(now - t_start, 1e-6)
+            eta_s        = (total - fi) / max(avg_fps, 1e-6)
+            pct = fi / total * 100
+            print(f"PROGRESS {pct:.1f} ({fi}/{total})", flush=True)
+            print(f"[RENDER] {interval_fps:.1f} fps  avg {avg_fps:.1f} fps  "
+                  f"ETA {eta_s:.0f}s  redraws {redraws}/{fi} ({redraws/fi*100:.1f}%)",
+                  flush=True)
+            t_last  = now
+            fi_last = fi
 
+    try:
+        ffmpeg_proc.stdin.close()
+    except Exception:
+        pass
     ffmpeg_proc.wait()
 
     if ffmpeg_proc.returncode == 0:

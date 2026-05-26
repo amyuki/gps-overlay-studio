@@ -296,7 +296,7 @@ async function loadFrame(path){
       st.className='path-status ok'; st.textContent='✓ Frame loaded';
       canvas.width=d.w; canvas.height=d.h;
       const img=new Image();
-      img.onload=()=>{ S.videoFrame=img; drawPreview(); };
+      img.onload=()=>{ S.videoFrame=img; drawPreview(); checkReady(); };
       img.src=d.data;
       canvas.style.display='block';
       document.getElementById('previewHint').style.display='none';
@@ -304,8 +304,8 @@ async function loadFrame(path){
       el.className='path-input error';
       st.className='path-status err'; st.textContent='❌ '+(d.error||'Cannot open video');
       S.videoFrame=null;
+      checkReady();
     }
-    checkReady();
   }catch(e){
     st.textContent='❌ Server error'; S.videoFrame=null;
   }
@@ -444,6 +444,14 @@ async function poll(jobId){
 
   if(d.status==='done'){
     document.getElementById('progressFill').style.width='100%';
+    // flush any remaining log lines (e.g. [RENDER] Widget redraws summary)
+    if(d.logs&&d.logs.length>S.lastLogCount){
+      d.logs.slice(S.lastLogCount).forEach(l=>{
+        const cls=l.startsWith('✅')?'lok':l.startsWith('❌')?'lerr':l.startsWith('⏳')?'lprog':'';
+        addLog(l,cls);
+      });
+      S.lastLogCount=d.logs.length;
+    }
     const btn=document.getElementById('renderBtn');
     btn.disabled=false; btn.textContent='▶ Re-render';
     document.getElementById('outputSection').classList.add('visible');
