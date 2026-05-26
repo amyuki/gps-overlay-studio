@@ -145,9 +145,11 @@ def render():
                             all_logs.append(friendly)
                     except Exception:
                         pass
+                elif line.startswith("[RENDER] ") and all_logs and all_logs[-1].startswith("[RENDER] "):
+                    all_logs[-1] = line  # replace in-place, don't accumulate
                 else:
                     all_logs.append(line)
-                jobs[job_id]["logs"] = all_logs[-50:]
+                jobs[job_id]["logs"] = all_logs[-100:]
             proc.wait()
             if proc.returncode == 0:
                 jobs[job_id].update(status="done", progress=100, output_path=out_path)
